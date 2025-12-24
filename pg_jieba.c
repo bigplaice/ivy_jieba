@@ -103,6 +103,9 @@ Datum ivyjieba_add_user_word(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(ivyjieba_del_user_word);
 Datum ivyjieba_del_user_word(PG_FUNCTION_ARGS);
 
+PG_FUNCTION_INFO_V1(ivyjieba_del_user_dict);
+Datum ivyjieba_del_user_dict(PG_FUNCTION_ARGS);
+
 #define DICT_EXT "dict"
 #define MODEL_EXT "model"
 
@@ -626,6 +629,26 @@ ivyjieba_del_user_word(PG_FUNCTION_ARGS)
 
 	ret_str = ivyjieba_process_user_word(arr, false);
 	PG_RETURN_TEXT_P(cstring_to_text(ret_str));
+}
+
+Datum 
+ivyjieba_del_user_dict(PG_FUNCTION_ARGS)
+{
+	FILE *fp = NULL;
+	char share_path[MAXPGPATH];
+	char dict_path[MAXPGPATH];
+
+	get_share_path(my_exec_path, share_path);
+	snprintf(dict_path, MAXPGPATH, "%s/tsearch_data/jieba_user.dict", share_path);
+
+	fp = fopen(dict_path, "w");
+	if (fp == NULL) 
+	{
+		PG_RETURN_TEXT_P(cstring_to_text("can not open user dict."));
+	}
+
+	fclose(fp);
+	PG_RETURN_TEXT_P(cstring_to_text("successfully cleared user dict."));
 }
 
 #if 0
