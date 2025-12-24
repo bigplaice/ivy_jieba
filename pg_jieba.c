@@ -20,6 +20,17 @@
 #include "miscadmin.h"
 #include "tsearch/ts_public.h"
 
+#include "fmgr.h"
+#include "utils/builtins.h"
+#include "utils/memutils.h"
+#include "utils/elog.h"
+#include "utils/lsyscache.h"  /* for get_fn_expr_argtype */
+#include "port.h"		/* for get_share_path() */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+
 #include "jieba.h"
 
 PG_MODULE_MAGIC;
@@ -37,6 +48,23 @@ typedef struct
 	JiebaCtx   *ctx;
 	ParStat    *stat;
 } ParserState;
+
+/* internal structure: the word to be updated */
+typedef struct {
+    char   *word;
+    int32   freq;
+    bool    freq_given;
+    char   *tag;
+    bool    tag_given;
+} UpdateEntry;
+
+/* current words (for lookup and position record) */
+typedef struct {
+    char   *word;
+    int32   freq;
+    char   *tag;
+    int     line_index;     
+} DictEntry;
 
 
 void _PG_init(void);
@@ -68,6 +96,9 @@ Datum jieba_lextype(PG_FUNCTION_ARGS);
 
 PG_FUNCTION_INFO_V1(jieba_reload_dict);
 Datum jieba_reload_dict(PG_FUNCTION_ARGS);
+
+PG_FUNCTION_INFO_V1(ivyjieba_add_user_word);
+Datum ivyjieba_add_user_word(PG_FUNCTION_ARGS);
 
 
 #define DICT_EXT "dict"
@@ -252,6 +283,261 @@ jieba_reload_dict(PG_FUNCTION_ARGS)
     userDictsValid = false;
     recompute_dicts_path();
 	PG_RETURN_VOID();
+}
+
+Datum
+ivyjieba_add_user_word(PG_FUNCTION_ARGS)
+{
+    char share_path[MAXPGPATH];
+    char dict_path[MAXPGPATH];
+    List *entries = NIL;
+    List *lines = NIL;
+    List *existing = NIL;
+    int updated_count = 0;
+    int added_count = 0;
+    StringInfoData output;
+    FILE *fp = NULL;
+    FILE *out = NULL;
+    char *line = NULL;
+    size_t len = 0;
+    ssize_t nread;
+    int index = 0;
+    ListCell *cell = NULL;
+    ListCell *ecell = NULL;
+    UpdateEntry *e = NULL;
+    DictEntry *de = NULL;
+    char *original_line = NULL;
+    char *trimmed = NULL;
+    char *word_part = NULL;
+    char *freq_part = NULL;
+    char *tag_part = NULL;
+    char *new_line = NULL;
+    int32 new_freq = 0;
+    char *new_tag = NULL;
+    bool changed = false;
+    char *saveptr = NULL;
+
+    int i;
+    int ndim;
+    int nelems;
+    Datum *elems;
+    bool *nulls;
+    char *input;
+    char *token;
+    ArrayType *arr;
+
+    initStringInfo(&output);
+
+    /* construct dict path */
+    get_share_path(my_exec_path, share_path);
+    snprintf(dict_path, MAXPGPATH, "%s/tsearch_data/jieba_user.dict", share_path);
+
+    /* 1. collect the words to be processed. */
+    /* array mode: word,freq,tag (separated by comma) */
+    arr = PG_GETARG_ARRAYTYPE_P(0);
+    ndim = ARR_NDIM(arr);
+    if (ndim != 1)
+        ereport(ERROR, (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+                        errmsg("only one-dimensional array is supported.")));
+
+    deconstruct_array(arr, TEXTOID, -1, false, 'i', &elems, &nulls, &nelems);
+
+    for (i = 0; i < nelems; i++)
+    {
+        if (nulls[i])
+            continue;
+
+        input = text_to_cstring(DatumGetTextPP(elems[i]));
+
+        e = (UpdateEntry *) palloc(sizeof(UpdateEntry));
+        e->freq_given = false;
+        e->tag_given = false;
+
+        token = strtok_r(input, ",", &saveptr);
+        if (token && *token != '\0')
+            e->word = pstrdup(token);
+        else
+        {
+            pfree(input);
+            continue;
+        }
+
+        token = strtok_r(NULL, ",", &saveptr);
+        if (token && *token != '\0')
+        {
+            int j, n = 0;
+
+            n = strlen(token);
+            for(j = 0; j < n; j++)
+            {
+                if(isdigit(token[j]) == 0)
+                {
+                    // found non-digit char
+                    e->freq = 1000; // default value
+                    e->freq_given = true;
+                    break;
+                }
+            }
+
+            if(e->freq_given == false)
+            {
+                e->freq = atoi(token);
+                e->freq_given = true;
+            }
+        }
+
+        token = strtok_r(NULL, ",", &saveptr);
+        if (token && *token != '\0')
+        {
+            e->tag = pstrdup(token);
+            e->tag_given = true;
+        }
+        else
+        {
+            e->tag = pstrdup("");
+        }
+
+        entries = lappend(entries, e);
+        pfree(input);
+    }
+
+    if (entries == NIL)
+        PG_RETURN_TEXT_P(cstring_to_text("no valid word passed."));
+
+    /* 2. read the dict file */
+    fp = fopen(dict_path, "r");
+    if (fp)
+    {
+        char *p;
+
+        while ((nread = getline(&line, &len, fp)) != -1)
+        {
+            original_line = pstrdup(line);
+
+            if (nread > 0 && original_line[nread-1] == '\n')
+                original_line[--nread] = '\0';
+            if (nread > 0 && original_line[nread-1] == '\r')
+                original_line[--nread] = '\0';
+
+            lines = lappend(lines, original_line);
+
+            trimmed = pstrdup(line);
+            p = trimmed;
+            while (isspace(*p)) p++;
+
+            if (*p == '\0' || *p == '#')
+            {
+                pfree(trimmed);
+                index++;
+                continue;
+            }
+
+            word_part = strtok(trimmed, " \t\r\n");
+            if (!word_part)
+            {
+                pfree(trimmed);
+                index++;
+                continue;
+            }
+
+            freq_part = strtok(NULL, " \t\r\n");
+            tag_part = strtok(NULL, " \t\r\n");
+
+            de = (DictEntry *) palloc(sizeof(DictEntry));
+            de->word = pstrdup(word_part);
+            de->freq = freq_part ? atoi(freq_part) : 0;
+            de->tag = tag_part ? pstrdup(tag_part) : pstrdup("");
+            de->line_index = index;
+
+            existing = lappend(existing, de);
+            pfree(trimmed);
+            index++;
+        }
+        if (line)
+            free(line);
+        fclose(fp);
+    }
+
+    /* 3. process each word */
+    foreach(cell, entries)
+    {
+        bool found = false;
+        e = (UpdateEntry *) lfirst(cell);
+
+        foreach(ecell, existing)
+        {
+            de = (DictEntry *) lfirst(ecell);
+            if (strcmp(de->word, e->word) == 0)
+            {
+                found = true;
+
+                new_freq = e->freq_given ? e->freq : de->freq;
+                new_tag = e->tag_given ? e->tag : de->tag;
+
+                changed = false;
+                if (e->freq_given && new_freq != de->freq)
+                    changed = true;
+                if (e->tag_given && strcmp(new_tag, de->tag) != 0)
+                    changed = true;
+
+                if (changed)
+                {
+                    ListCell *lcell;
+
+                    if (new_freq > 0 && new_tag[0] != '\0')
+                        new_line = psprintf("%s %d %s", e->word, new_freq, new_tag);
+                    else if (new_freq > 0)
+                        new_line = psprintf("%s %d", e->word, new_freq);
+                    else if (new_tag[0] != '\0')
+                        new_line = psprintf("%s %s", e->word, new_tag);
+                    else
+                        new_line = pstrdup(e->word);
+
+                    lcell = list_nth_cell(lines, de->line_index);
+                    pfree(lfirst(lcell));
+                    lfirst(lcell) = new_line;
+
+                    updated_count++;
+                }
+                break;
+            }
+        }
+
+        if (!found)
+        {
+            new_freq = e->freq_given ? e->freq : 1000;
+            new_tag = e->tag_given ? e->tag : "";
+
+            if (new_tag[0] != '\0')
+                new_line = psprintf("%s %d %s", e->word, new_freq, new_tag);
+            else
+                new_line = psprintf("%s %d", e->word, new_freq);
+
+            lines = lappend(lines, new_line);
+            added_count++;
+        }
+    }
+
+    /* 4. write back to dict file */
+    if (updated_count > 0 || added_count > 0)
+    {
+        out = fopen(dict_path, "w");
+        if (!out)
+            ereport(ERROR,
+                    (errcode_for_file_access(),
+                     errmsg("can not write into dict file \"%s\": %m", dict_path)));
+
+        foreach(cell, lines)
+        {
+            char *ln = (char *) lfirst(cell);
+            fprintf(out, "%s\n", ln);
+        }
+        fclose(out);
+    }
+
+    /* 5. return the result */
+    appendStringInfo(&output, "operation completed: add %d, update %d", added_count, updated_count);
+    PG_RETURN_TEXT_P(cstring_to_text(output.data));
 }
 
 static void
