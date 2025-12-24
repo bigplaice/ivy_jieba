@@ -45,6 +45,13 @@ RETURNS text
 AS 'MODULE_PATHNAME', 'ivyjieba_add_user_word'
 LANGUAGE C STRICT;
 
+CREATE OR REPLACE FUNCTION ivyjieba_del_user_word(
+    entries text[] DEFAULT NULL
+)
+RETURNS text
+AS 'MODULE_PATHNAME', 'ivyjieba_del_user_word'
+LANGUAGE C STRICT;
+
 CREATE TEXT SEARCH PARSER jieba (
 	START    = jieba_start,
 	GETTOKEN = jieba_gettoken,
